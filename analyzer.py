@@ -10,8 +10,8 @@ import matplotlib
 # 強制使用 Agg 後端以確保在 GitHub Actions 等無界面環境穩定執行
 matplotlib.use('Agg')
 
-# 字體設定 (支援中日韓字元)
-plt.rcParams['font.sans-serif'] = ['Noto Sans CJK TC', 'Noto Sans CJK JP', 'Microsoft JhengHei', 'Arial Unicode MS', 'sans-serif']
+# 字體設定 (支援中日韓字元，確保簡繁中、日、韓文顯示正常)
+plt.rcParams['font.sans-serif'] = ['Noto Sans CJK TC', 'Noto Sans CJK JP', 'Noto Sans CJK KR', 'Microsoft JhengHei', 'Arial Unicode MS', 'sans-serif']
 plt.rcParams['axes.unicode_minus'] = False
 
 # 基礎分箱設定
@@ -23,18 +23,36 @@ def get_market_url(market_id, ticker):
     """
     智慧連結引擎：根據市場別生成對應的技術線圖連結
     """
-    if market_id == "us-share":
+    m_id = market_id.lower()
+    
+    if m_id == "us-share":
         # 🇺🇸 美股連結：StockCharts
         return f"https://stockcharts.com/sc3/ui/?s={ticker}"
     
-    elif market_id == "hk-share":
-        # 🇭🇰 港股連結：AASTOCKS
-        # 邏輯：先拿掉 .HK，再確保是 5 位數 (例如 00700.HK -> 00700)
+    elif m_id == "hk-share":
+        # 🇭🇰 港股連結：AASTOCKS (補足5位數)
         clean_code = ticker.replace(".HK", "").strip().zfill(5)
         return f"https://www.aastocks.com/tc/stocks/quote/stocktrend.aspx?symbol={clean_code}"
 
+    elif m_id == "cn-share":
+        # 🇨🇳 中國 A 股連結：東方財富 (識別 sh/sz)
+        prefix = "sh" if ticker.startswith('6') else "sz"
+        return f"https://quote.eastmoney.com/{prefix}{ticker}.html"
+
+    elif m_id == "jp-share":
+        # 🇯🇵 日本連結：樂天證券 (Rakuten Securities)
+        # 格式範例：7203.T
+        clean_ticker = ticker if ".T" in ticker.upper() else f"{ticker.split('.')[0]}.T"
+        return f"https://www.rakuten-sec.co.jp/web/market/search/quote.html?ric={clean_ticker}"
+
+    elif m_id == "kr-share":
+        # 🇰🇷 韓國連結：Naver Finance
+        # 邏輯：Naver 僅接受純數字代碼，去除 .KS 或 .KQ
+        clean_code = ticker.split('.')[0]
+        return f"https://finance.naver.com/item/main.naver?code={clean_code}"
+
     else:
-        # 🇹🇼 台股連結：玩股網 (去除 .TW 或 .TWO)
+        # 🇹🇼 台股連結：玩股網
         clean_ticker = ticker.split('.')[0]
         return f"https://www.wantgoo.com/stock/{clean_ticker}/technical-chart"
 
@@ -47,7 +65,6 @@ def build_company_list(arr_pct, codes, names, bins, market_id):
     
     def make_link(i):
         url = get_market_url(market_id, codes[i])
-        # 顯示格式：代號(名稱)
         return f'<a href="{url}" style="text-decoration:none; color:#0366d6;">{codes[i]}({names[i]})</a>'
 
     for lo in range(int(X_MIN), int(X_MAX), int(BIN_SIZE)):
@@ -83,7 +100,6 @@ def run_global_analysis(market_id="tw-share"):
     market_label = market_id.upper()
     print(f"📊 正在啟動 {market_label} 深度矩陣分析...")
     
-    # 路徑定位
     data_path = Path("./data") / market_id / "dayK"
     image_out_dir = Path("./output/images") / market_id
     image_out_dir.mkdir(parents=True, exist_ok=True)
@@ -103,25 +119,25 @@ def run_global_analysis(market_id="tw-share"):
             
             # 解析代號與名稱
             stem = f.name.replace(".csv", "")
-            if market_id == "hk-share":
-                # 港股格式：00700.HK (不帶下底線)
+            
+            # 多國檔名解析策略
+            if market_id in ["hk-share", "jp-share", "kr-share"]:
+                # 港日韓多為單一代號格式 (如 7203.T.csv 或 005930.KS.csv)
                 tkr = stem
                 nm = stem
             elif "_" in stem:
-                # 台美股格式：Ticker_Name
+                # 台、美、中 (如 AAPL_Apple.csv 或 600519_貴州茅台.csv)
                 tkr, nm = stem.split('_', 1)
             else:
                 tkr, nm = stem, stem
                 
             row = {'Ticker': tkr, 'Full_Name': nm}
             
-            # 定義回報週期
             periods = [('Week', 5), ('Month', 20), ('Year', 250)]
             for p_name, days in periods:
                 if len(close) <= days: continue
                 prev_c = close[-(days+1)]
                 if prev_c <= 0: continue
-                # 計算：最高、收盤、最低之報酬率
                 row[f'{p_name}_High'] = (max(high[-days:]) - prev_c) / prev_c * 100
                 row[f'{p_name}_Close'] = (close[-1] - prev_c) / prev_c * 100
                 row[f'{p_name}_Low'] = (min(low[-days:]) - prev_c) / prev_c * 100
@@ -134,7 +150,7 @@ def run_global_analysis(market_id="tw-share"):
     # --- 繪圖邏輯 ---
     images = []
     color_map = {'High': '#28a745', 'Close': '#007bff', 'Low': '#dc3545'}
-    EXTREME_COLOR = '#FF4500' # 飆股區間配色
+    EXTREME_COLOR = '#FF4500' 
     plot_bins = np.append(BINS, X_MAX + BIN_SIZE)
 
     for p_n, p_z in [('Week', '週'), ('Month', '月'), ('Year', '年')]:
@@ -144,19 +160,15 @@ def run_global_analysis(market_id="tw-share"):
             data = df_res[col].dropna()
             
             fig, ax = plt.subplots(figsize=(12, 7))
-            # 限制數據範圍在圖表內
             clipped_data = np.clip(data.values, X_MIN, X_MAX + BIN_SIZE)
             counts, edges = np.histogram(clipped_data, bins=plot_bins)
             
-            # 畫一般區間
             ax.bar(edges[:-2], counts[:-1], width=9, align='edge', 
                    color=color_map[t_n], alpha=0.7, edgecolor='white')
-            # 畫極端區間 (>100%)
             ax.bar(edges[-2], counts[-1], width=9, align='edge', 
                    color=EXTREME_COLOR, alpha=0.9, edgecolor='black', linewidth=1.5)
             
             max_h = counts.max() if len(counts) > 0 else 1
-            # 標註數字
             for i, h in enumerate(counts):
                 if h > 0:
                     x_pos = edges[i] + 4.5
@@ -178,17 +190,10 @@ def run_global_analysis(market_id="tw-share"):
             plt.close()
             images.append({'id': col.lower(), 'path': str(img_path), 'label': f"【{market_label}】{p_z}K {t_z}"})
 
-    # 生成各週期的分箱報表
     text_reports = {}
     for p_n in ['Week', 'Month', 'Year']:
         col = f'{p_n}_High'
         if col in df_res.columns:
-            text_reports[p_n] = build_company_list(
-                df_res[col].values, 
-                df_res['Ticker'].tolist(), 
-                df_res['Full_Name'].tolist(), 
-                BINS,
-                market_id
-            )
+            text_reports[p_n] = build_company_list(df_res[col].values, df_res['Ticker'].tolist(), df_res['Full_Name'].tolist(), BINS, market_id)
     
     return images, df_res, text_reports
