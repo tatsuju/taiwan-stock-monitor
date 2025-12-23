@@ -9,6 +9,7 @@ from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
 from pathlib import Path
+from datetime import datetime
 
 # ========== 核心參數設定 ==========
 MARKET_CODE = "tw-share"
@@ -19,6 +20,10 @@ DATA_DIR = os.path.join(BASE_DIR, "data", MARKET_CODE, DATA_SUBDIR)
 # ✅ 效能優化：維持 3 執行緒，配合亂數延遲可有效避開 Yahoo 封鎖
 MAX_WORKERS = 3 
 Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
+
+# 💡 定義數據過期時間 (3600 秒 = 1 小時)
+# 這能確保在盤中執行時，若檔案超過一小時就會強制更新最新價格
+DATA_EXPIRY_SECONDS = 3600
 
 def log(msg: str):
     print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
@@ -51,7 +56,7 @@ def get_full_stock_list():
     return list(set(all_items))
 
 def download_stock_data(item):
-    """具備隨機延遲與自動重試的下載邏輯"""
+    """具備隨機延遲、過期檢查與自動重試的下載邏輯"""
     yf_tkr = "ParseError"
     try:
         parts = item.split('&', 1)
@@ -61,12 +66,15 @@ def download_stock_data(item):
         safe_name = "".join([c for c in name if c.isalnum() or c in (' ', '_', '-')]).strip()
         out_path = os.path.join(DATA_DIR, f"{yf_tkr}_{safe_name}.csv")
         
-        if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
-            return {"status": "exists", "tkr": yf_tkr}
+        # 💡 核心修改：智慧檢查檔案「是否存在」且「是否夠新」
+        if os.path.exists(out_path):
+            file_age = time.time() - os.path.getmtime(out_path)
+            # 檔案小於 1 小時 (3600秒) 則跳過，大於則重新下載
+            if file_age < DATA_EXPIRY_SECONDS and os.path.getsize(out_path) > 1000:
+                return {"status": "exists", "tkr": yf_tkr}
 
-        # 隨機休眠避開偵測
+        # 若檔案過期或不存在，執行下載流程
         time.sleep(random.uniform(0.5, 1.15))
-
         tk = yf.Ticker(yf_tkr)
         
         for attempt in range(2):
@@ -75,6 +83,9 @@ def download_stock_data(item):
                 if hist is not None and not hist.empty:
                     hist.reset_index(inplace=True)
                     hist.columns = [c.lower() for c in hist.columns]
+                    # 強制處理日期為無時區格式
+                    if 'date' in hist.columns:
+                        hist['date'] = pd.to_datetime(hist['date'], utc=True).dt.tz_localize(None)
                     hist.to_csv(out_path, index=False, encoding='utf-8-sig')
                     return {"status": "success", "tkr": yf_tkr}
                 
@@ -94,7 +105,7 @@ def download_stock_data(item):
 def main():
     start_time = time.time()
     items = get_full_stock_list()
-    log(f"🚀 啟動防封鎖下載模式，目標總數: {len(items)}")
+    log(f"🚀 啟動台股同步流程 (時效檢查模式)，目標總數: {len(items)}")
     
     stats = {"success": 0, "exists": 0, "empty": 0, "error": 0}
     error_details = {}
@@ -112,13 +123,11 @@ def main():
                 error_details[msg] = error_details.get(msg, 0) + 1
             pbar.update(1)
             
-            # 每 100 檔強制休息，清理連線防止 IP 被黑
             if pbar.n % 100 == 0:
                 time.sleep(random.uniform(5, 10))
                 
         pbar.close()
     
-    # --- 💡 關鍵統計彙整：準備回傳給 main.py 與 notifier ---
     total_expected = len(items)
     effective_success = stats['success'] + stats['exists']
     fail_count = stats['error'] + stats['empty']
@@ -130,20 +139,18 @@ def main():
     }
 
     duration = (time.time() - start_time) / 60
-    print("\n" + "="*50)
-    log(f"📊 台股下載任務完成 (耗時 {duration:.1f} 分鐘)")
+    log(f"📊 任務完成 (耗時 {duration:.1f} 分鐘)")
     print(f"   - 應收總數: {total_expected}")
     print(f"   - 成功(含舊檔): {effective_success}")
     print(f"   - 失敗/無數據: {fail_count}")
     print(f"📈 數據完整度: {(effective_success/total_expected)*100:.2f}%")
     
     if error_details:
-        print("\n⚠️ 失敗原因簡析:")
+        print("\n⚠️ 失敗原因分析:")
         for msg, count in sorted(error_details.items(), key=lambda x: x[1], reverse=True):
             print(f"   - [{count}次]: {msg}")
-    print("="*50 + "\n")
-
-    return download_stats # 🚀 回傳統計字典
+    
+    return download_stats
 
 if __name__ == "__main__":
     main()
