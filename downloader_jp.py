@@ -1,13 +1,12 @@
 # -*- coding: utf-8 -*-
-import os, sys, time, random, logging, warnings, subprocess, json
-from pathlib import Path
+import os, sys, time, random, subprocess, sqlite3
+import pandas as pd
+import yfinance as yf
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
-import pandas as pd
-import yfinance as yf
 
-# ====== 自動安裝/匯入必要套件 ======
+# ====== 自動安裝必要套件 ======
 def ensure_pkg(pkg_install_name, import_name):
     try:
         __import__(import_name)
@@ -18,179 +17,137 @@ def ensure_pkg(pkg_install_name, import_name):
 ensure_pkg("tokyo-stock-exchange", "tokyo_stock_exchange")
 from tokyo_stock_exchange import tse
 
-# ====== 降噪與環境設定 ======
-warnings.filterwarnings("ignore")
-logging.getLogger("yfinance").setLevel(logging.CRITICAL)
-
-# 路徑定義
+# ========== 核心參數設定 ==========
 MARKET_CODE = "jp-share"
 DATA_SUBDIR = "dayK"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# 資料與審計資料庫路徑
 DATA_DIR = os.path.join(BASE_DIR, "data", MARKET_CODE, DATA_SUBDIR)
-LIST_DIR = os.path.join(BASE_DIR, "data", MARKET_CODE, "lists")
+AUDIT_DB_PATH = os.path.join(BASE_DIR, "data_warehouse_audit.db")
+
+# ✅ 效能與時效設定
+MAX_WORKERS = 4 
+DATA_EXPIRY_SECONDS = 3600  # 1 小時內抓過則跳過
 
 os.makedirs(DATA_DIR, exist_ok=True)
-os.makedirs(LIST_DIR, exist_ok=True)
 
-# 狀態管理檔案
-MANIFEST_CSV = Path(LIST_DIR) / "jp_manifest.csv"
-LIST_ALL_CSV = Path(LIST_DIR) / "jp_list_all.csv"
-THREADS = 4 
+def init_audit_db():
+    """初始化審計資料庫"""
+    conn = sqlite3.connect(AUDIT_DB_PATH)
+    conn.execute('''CREATE TABLE IF NOT EXISTS sync_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        execution_time TEXT,
+        market_id TEXT,
+        total_count INTEGER,
+        success_count INTEGER,
+        fail_count INTEGER,
+        success_rate REAL
+    )''')
+    conn.close()
 
-# 💡 核心新增：數據過期時間 (3600 秒 = 1 小時)
-DATA_EXPIRY_SECONDS = 3600
-
-def log(msg: str):
-    print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
-
-def get_tse_list():
-    """獲取日股清單：具備門檻檢查與歷史快取備援"""
-    threshold = 3800 
-    log("📡 正在獲取東京交易所標的清單...")
+def get_full_stock_list():
+    """獲取日股完整清單 (TSE)"""
+    threshold = 3000
+    print("📡 正在從 TSE 資料庫獲取日股清單...")
     try:
         df = pd.read_csv(tse.csv_file_path)
         code_col = next((c for c in ['コード', 'Code', 'code', 'Local Code'] if c in df.columns), None)
-        name_col = next((c for c in ['銘柄名', 'Name', 'name', 'Company Name'] if c in df.columns), None)
-
-        if not code_col: raise KeyError("無法定位代碼欄位")
-
+        
         res = []
         for _, row in df.iterrows():
             code = str(row[code_col]).strip()
             if len(code) >= 4 and code[:4].isdigit():
-                res.append({
-                    "code": code[:4], 
-                    "name": str(row[name_col]) if name_col else code[:4], 
-                    "board": "T"
-                })
+                res.append(f"{code[:4]}.T")
         
-        final_df = pd.DataFrame(res).drop_duplicates(subset=['code'])
-        
-        if len(final_df) < threshold:
-            log(f"⚠️ 數量異常 ({len(final_df)})，嘗試讀取歷史快取...")
-            if LIST_ALL_CSV.exists(): return pd.read_csv(LIST_ALL_CSV)
-        else:
-            final_df.to_csv(LIST_ALL_CSV, index=False, encoding='utf-8-sig')
-            log(f"✅ 成功獲取 {len(final_df)} 檔日股清單")
-        return final_df
-
+        final_list = list(set(res))
+        if len(final_list) >= threshold:
+            print(f"✅ 成功獲取 {len(final_list)} 檔日股代號")
+            return final_list
     except Exception as e:
-        log(f"❌ 清單獲取失敗: {e}")
-        return pd.read_csv(LIST_ALL_CSV) if LIST_ALL_CSV.exists() else pd.DataFrame()
-
-def build_manifest(df_list):
-    """建立續跑清單，偵測檔案時效性"""
-    if MANIFEST_CSV.exists():
-        mf = pd.read_csv(MANIFEST_CSV)
-        new_codes = df_list[~df_list['code'].astype(str).isin(mf['code'].astype(str))]
-        if not new_codes.empty:
-            new_codes_df = new_codes.copy()
-            new_codes_df['status'] = 'pending'
-            mf = pd.concat([mf, new_codes_df], ignore_index=True)
-    else:
-        mf = df_list.copy()
-        mf["status"] = "pending"
-
-    # 💡 智慧時效檢查：若檔案太舊，則標記為 pending 重新抓取
-    log("🔍 正在檢查日股數據時效性...")
-    for idx, row in mf.iterrows():
-        code_str = str(row['code']).zfill(4)
-        out_path = os.path.join(DATA_DIR, f"{code_str}.T.csv")
-        
-        if os.path.exists(out_path):
-            file_age = time.time() - os.path.getmtime(out_path)
-            if file_age < DATA_EXPIRY_SECONDS and os.path.getsize(out_path) > 1000:
-                mf.at[idx, "status"] = "done"
-            else:
-                mf.at[idx, "status"] = "pending" # 超過一小時，標記重新下載
-        else:
-            mf.at[idx, "status"] = "pending"
-
-    mf.to_csv(MANIFEST_CSV, index=False)
-    return mf
-
-def download_one(row_tuple):
-    """強化版下載：加入 3 次重試機制與動態延遲"""
-    idx, row = row_tuple
-    code = str(row['code']).zfill(4)
-    symbol = f"{code}.T"
-    out_path = os.path.join(DATA_DIR, f"{code}.T.csv")
+        print(f"❌ 日股清單獲取失敗: {e}")
     
-    max_retries = 3
-    for attempt in range(max_retries):
-        try:
-            time.sleep(random.uniform(0.5, 1.2)) 
-            tk = yf.Ticker(symbol)
-            df_raw = tk.history(period="2y", interval="1d", auto_adjust=True, timeout=20)
-            
-            if df_raw is not None and not df_raw.empty:
-                df_raw.reset_index(inplace=True)
-                df_raw.columns = [c.lower() for c in df_raw.columns]
-                if 'date' in df_raw.columns:
-                    df_raw['date'] = pd.to_datetime(df_raw['date'], utc=True).dt.tz_localize(None)
-                
-                cols = ['date','open','high','low','close','volume']
-                df_final = df_raw[[c for c in cols if c in df_raw.columns]]
-                df_final.to_csv(out_path, index=False, encoding='utf-8-sig')
-                return idx, "done"
-            
-            if attempt == max_retries - 1: return idx, "empty"
-        except Exception:
-            if attempt == max_retries - 1: return idx, "failed"
-            time.sleep(random.randint(3, 7))
-            
-    return idx, "failed"
+    return ["7203.T"] # 豐田汽車保底
+
+def download_one(symbol, period):
+    """單檔下載邏輯：智慧快取 + 重試"""
+    out_path = os.path.join(DATA_DIR, f"{symbol}.csv")
+    
+    # 💡 智慧快取檢查 (抓過且在效期內則跳過)
+    if os.path.exists(out_path):
+        file_age = time.time() - os.path.getmtime(out_path)
+        if file_age < DATA_EXPIRY_SECONDS and os.path.getsize(out_path) > 1000:
+            return {"status": "exists", "tkr": symbol}
+
+    try:
+        time.sleep(random.uniform(0.6, 1.3))
+        tk = yf.Ticker(symbol)
+        hist = tk.history(period=period, timeout=30)
+        
+        if hist is not None and not hist.empty:
+            hist = hist.reset_index()
+            hist.columns = [c.lower() for c in hist.columns]
+            if 'date' in hist.columns:
+                hist['date'] = pd.to_datetime(hist['date'], utc=True).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
+                hist['symbol'] = symbol
+                hist[['date', 'symbol', 'open', 'high', 'low', 'close', 'volume']].to_csv(out_path, index=False, encoding='utf-8-sig')
+                return {"status": "success", "tkr": symbol}
+        return {"status": "empty", "tkr": symbol}
+    except:
+        return {"status": "error", "tkr": symbol}
 
 def main():
+    """主進入點：對接 main.py 邏輯"""
     start_time = time.time()
-    log("🇯🇵 日本股市同步器啟動 (時效檢查模式)")
+    init_audit_db()
     
-    df_list = get_tse_list()
-    if df_list.empty: 
-        log("🚨 無法取得清單，結束程序。")
-        return
-    mf = build_manifest(df_list)
-
-    todo = mf[~mf["status"].isin(["done", "empty"])]
+    # 這裡預設為增量更新，若需初次抓取請由外部傳參
+    is_first_time = False 
+    period = "max" if is_first_time else "7d"
     
-    if not todo.empty:
-        log(f"📝 待處理標的數：{len(todo)} 檔 (其餘 {len(mf)-len(todo)} 檔在效期內)")
-        with ThreadPoolExecutor(max_workers=THREADS) as executor:
-            futures = {executor.submit(download_one, item): item for item in todo.iterrows()}
-            pbar = tqdm(total=len(todo), desc="日股下載進度")
-            count = 0
-            try:
-                for f in as_completed(futures):
-                    idx, status = f.result()
-                    mf.at[idx, "status"] = status
-                    count += 1
-                    pbar.update(1)
-                    if count % 100 == 0:
-                        mf.to_csv(MANIFEST_CSV, index=False)
-            except KeyboardInterrupt:
-                log("🛑 中斷下載...")
-            finally:
-                mf.to_csv(MANIFEST_CSV, index=False)
-                pbar.close()
-    else:
-        log("✅ 所有日股資料皆在 1 小時內更新過。")
+    items = get_full_stock_list()
+    print(f"🚀 日股任務啟動: {period}, 目標: {len(items)} 檔")
+    
+    stats = {"success": 0, "exists": 0, "empty": 0, "error": 0}
+    fail_list = []
 
-    total_expected = len(mf)
-    effective_success = len(mf[mf['status'] == 'done'])
-    fail_count = total_expected - effective_success
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(download_one, tkr, period): tkr for tkr in items}
+        pbar = tqdm(total=len(items), desc="JP 下載進度")
+        
+        for future in as_completed(futures):
+            res = future.result()
+            s = res.get("status", "error")
+            stats[s] += 1
+            if s in ["error", "empty"]:
+                fail_list.append(res.get("tkr", "Unknown"))
+            pbar.update(1)
+        pbar.close()
 
+    total = len(items)
+    success = stats['success'] + stats['exists']
+    fail = stats['error'] + stats['empty']
+    rate = round((success / total * 100), 2) if total > 0 else 0
+
+    # 🚀 紀錄 Audit DB (台北時間 UTC+8)
+    conn = sqlite3.connect(AUDIT_DB_PATH)
+    try:
+        now_ts = (datetime.utcnow() + pd.Timedelta(hours=8)).strftime("%Y-%m-%d %H:%M:%S")
+        conn.execute('''INSERT INTO sync_audit 
+            (execution_time, market_id, total_count, success_count, fail_count, success_rate)
+            VALUES (?, ?, ?, ?, ?, ?)''', (now_ts, MARKET_CODE, total, success, fail, rate))
+        conn.commit()
+    finally:
+        conn.close()
+
+    # 回傳統計字典給 main.py
     download_stats = {
-        "total": total_expected,
-        "success": effective_success,
-        "fail": fail_count
+        "total": total,
+        "success": success,
+        "fail": fail,
+        "fail_list": fail_list
     }
 
-    duration = (time.time() - start_time) / 60
-    log("="*30)
-    log(f"📊 下載報告: 成功(含效期內)={effective_success}, 耗時={duration:.1f}分鐘")
-    log(f"📈 數據完整度: {(effective_success/total_expected)*100:.2f}%")
-    log("="*30)
-
+    print(f"📊 日股報告: 成功={success}, 失敗={fail}, 成功率={rate}%")
     return download_stats
 
 if __name__ == "__main__":
