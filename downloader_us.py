@@ -1,201 +1,139 @@
 # -*- coding: utf-8 -*-
-import os, io, time, random, sqlite3, requests
+import os
+import time
+import random
+import requests
 import pandas as pd
 import yfinance as yf
-from io import StringIO
+import json
 from datetime import datetime
+from io import StringIO
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from tqdm import tqdm
+from pathlib import Path
 
-# ========== 1. 環境判斷與參數設定 ==========
+# ========== 核心參數設定 ==========
 MARKET_CODE = "us-share"
+DATA_SUBDIR = "dayK"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DB_PATH = os.path.join(BASE_DIR, "us_stock_warehouse.db")
+DATA_DIR = os.path.join(BASE_DIR, "data", MARKET_CODE, DATA_SUBDIR)
+# 🚀 新增：清單快取路徑
+CACHE_LIST_PATH = os.path.join(BASE_DIR, "us_stock_list_cache.json")
 
-# 💡 自動判斷環境：GitHub Actions 執行時此變數為 true
-IS_GITHUB_ACTIONS = os.getenv('GITHUB_ACTIONS') == 'true'
-
-# ✅ 快取設定
-CACHE_DIR = os.path.join(BASE_DIR, "cache_us")
-DATA_EXPIRY_SECONDS = 86400  # 本機快取效期：24小時
-
-if not IS_GITHUB_ACTIONS and not os.path.exists(CACHE_DIR):
-    os.makedirs(CACHE_DIR, exist_ok=True)
-
-# ✅ 效能設定：美股量大，本機建議設 6-8 執行緒加速
-MAX_WORKERS = 5 if IS_GITHUB_ACTIONS else 8 
-LIST_THRESHOLD = 3000
+MAX_WORKERS = 5 
+Path(DATA_DIR).mkdir(parents=True, exist_ok=True)
 
 def log(msg: str):
     print(f"{pd.Timestamp.now():%H:%M:%S}: {msg}")
 
-# ========== 2. 核心輔助函式 ==========
-
-def insert_or_replace(table, conn, keys, data_iter):
-    """防止重複寫入的核心 SQL 邏輯"""
-    sql = f"INSERT OR REPLACE INTO {table.name} ({', '.join(keys)}) VALUES ({', '.join(['?']*len(keys))})"
-    conn.executemany(sql, data_iter)
-
-def init_db():
-    """初始化資料庫結構"""
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        conn.execute('''CREATE TABLE IF NOT EXISTS stock_prices (
-                            date TEXT, symbol TEXT, open REAL, high REAL, 
-                            low REAL, close REAL, volume INTEGER,
-                            PRIMARY KEY (date, symbol))''')
-        conn.execute('''CREATE TABLE IF NOT EXISTS stock_info (
-                            symbol TEXT PRIMARY KEY, name TEXT, sector TEXT, updated_at TEXT)''')
-        conn.commit()
-    finally:
-        conn.close()
-
 def classify_security(name: str, is_etf: bool) -> str:
-    """過濾掉權證、優先股、ETF 等非普通股標的"""
+    """過濾邏輯：僅保留高品質普通股"""
     if is_etf: return "Exclude"
-    n_upper = str(name).upper()
-    exclude_keywords = ["WARRANT", "RIGHTS", "UNIT", "PREFERRED", "DEPOSITARY", "ADR", "FOREIGN", "DEBENTURE", "PWT"]
+    n_upper = name.upper()
+    exclude_keywords = ["WARRANT", "RIGHTS", "UNIT", "PREFERRED", "DEPOSITARY", "ADR", "FOREIGN", "DEBENTURE"]
     if any(kw in n_upper for kw in exclude_keywords): return "Exclude"
     return "Common Stock"
 
-def get_us_stock_list():
-    """從 Nasdaq 獲取最新美股清單並同步名稱"""
-    all_items = []
-    log(f"📡 獲取美股清單... (環境: {'GitHub' if IS_GITHUB_ACTIONS else 'Local'})")
-    
-    urls = [
-        "https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt",
-        "https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt"
-    ]
-    
-    conn = sqlite3.connect(DB_PATH)
-    for url in urls:
-        try:
-            r = requests.get(url, timeout=15)
-            df = pd.read_csv(StringIO(r.text), sep="|")
-            df = df[df["Test Issue"] == "N"]
-            
-            sym_col = "Symbol" if "nasdaqlisted" in url else "NASDAQ Symbol"
-            name_col = "Security Name"
-            etf_col = "ETF"
-            
-            for _, row in df.iterrows():
-                name = str(row[name_col])
-                is_etf = str(row[etf_col]) == "Y"
-                
-                if classify_security(name, is_etf) == "Common Stock":
-                    symbol = str(row[sym_col]).strip().replace('$', '-')
-                    conn.execute("INSERT OR REPLACE INTO stock_info (symbol, name, updated_at) VALUES (?, ?, ?)",
-                                 (symbol, name, datetime.now().strftime("%Y-%m-%d")))
-                    all_items.append((symbol, name))
-            
-            time.sleep(1) 
-        except Exception as e:
-            log(f"⚠️ 清單抓取失敗 ({url}): {e}")
+def get_full_stock_list():
+    """
+    ⚡ 快取化清單獲取：
+    若今日已抓過清單則直接讀取，不重複請求 Nasdaq 官網
+    """
+    if os.path.exists(CACHE_LIST_PATH):
+        file_mtime = os.path.getmtime(CACHE_LIST_PATH)
+        # 如果檔案是今天產生的，就直接用
+        if datetime.fromtimestamp(file_mtime).date() == datetime.now().date():
+            log("📦 偵測到今日已緩存美股清單，直接載入...")
+            with open(CACHE_LIST_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
 
-    conn.commit()
-    conn.close()
-    
-    unique_items = list(set(all_items))
-    if len(unique_items) >= LIST_THRESHOLD:
-        log(f"✅ 成功同步美股清單: {len(unique_items)} 檔")
-        return unique_items
-    return [("AAPL", "APPLE INC"), ("TSLA", "TESLA INC")]
+    log("📡 緩存失效，開始從官網獲取美股普通股清單...")
+    all_rows = []
 
-# ========== 3. 核心下載/快取分流邏輯 ==========
-
-def download_one(args):
-    symbol, name, mode = args
-    csv_path = os.path.abspath(os.path.join(CACHE_DIR, f"{symbol}.csv"))
-    start_date = "2020-01-01" if mode == 'hot' else "1962-01-02"
-    
-    # --- ⚡ 閃電快取分流 ---
-    if not IS_GITHUB_ACTIONS and os.path.exists(csv_path):
-        file_age = time.time() - os.path.getmtime(csv_path)
-        if file_age < DATA_EXPIRY_SECONDS:
-            return {"symbol": symbol, "status": "cache"}
-
+    # 1. NASDAQ
     try:
-        # 美股建議 Jitter，避免被 Yahoo 封鎖
-        time.sleep(random.uniform(0.2, 0.7))
-        tk = yf.Ticker(symbol)
-        hist = tk.history(start=start_date, auto_adjust=True, timeout=30)
-        
-        if hist is None or hist.empty:
-            return {"symbol": symbol, "status": "empty"}
-            
-        hist.reset_index(inplace=True)
-        hist.columns = [c.lower() for c in hist.columns]
-        if 'date' in hist.columns:
-            # 美股時間處理 (轉為純日期)
-            hist['date'] = pd.to_datetime(hist['date']).dt.tz_localize(None).dt.strftime('%Y-%m-%d')
-        
-        df_final = hist[['date', 'open', 'high', 'low', 'close', 'volume']].copy()
-        df_final['symbol'] = symbol
-        
-        # 1. 存入本機 CSV 快取
-        if not IS_GITHUB_ACTIONS:
-            df_final.to_csv(csv_path, index=False)
+        r1 = requests.get("https://www.nasdaqtrader.com/dynamic/symdir/nasdaqlisted.txt", timeout=15)
+        df1 = pd.read_csv(StringIO(r1.text), sep="|")
+        df1 = df1[df1["Test Issue"] == "N"]
+        df1["Category"] = df1.apply(lambda row: classify_security(row["Security Name"], row["ETF"] == "Y"), axis=1)
+        f1 = df1[(df1["Market Category"].isin(["Q", "G"])) & (df1["Category"] == "Common Stock")]
+        for _, row in f1.iterrows():
+            all_rows.append(f"{str(row['Symbol']).strip().replace('$', '-')}&{str(row['Security Name']).strip()}")
+    except Exception as e: log(f"⚠️ NASDAQ 失敗: {e}")
 
-        # 2. 存入 SQL (防重複)
-        conn = sqlite3.connect(DB_PATH, timeout=30)
-        df_final.to_sql('stock_prices', conn, if_exists='append', index=False, method=insert_or_replace)
-        conn.close()
-        
-        return {"symbol": symbol, "status": "success"}
-    except Exception:
-        return {"symbol": symbol, "status": "error"}
+    # 2. NYSE/Other
+    try:
+        r2 = requests.get("https://www.nasdaqtrader.com/dynamic/symdir/otherlisted.txt", timeout=15)
+        df2 = pd.read_csv(StringIO(r2.text), sep="|")
+        df2 = df2[df2["Test Issue"] == "N"]
+        df2["Category"] = df2.apply(lambda row: classify_security(row["Security Name"], row["ETF"] == "Y"), axis=1)
+        f2 = df2[(df2["Exchange"] == "N") & (df2["Category"] == "Common Stock")]
+        for _, row in f2.iterrows():
+            all_rows.append(f"{str(row['NASDAQ Symbol']).strip().replace('$', '-')}&{str(row['Security Name']).strip()}")
+    except Exception as e: log(f"⚠️ NYSE 失敗: {e}")
 
-# ========== 4. 主流程 ==========
-
-def run_sync(mode='hot'):
-    start_time = time.time()
-    init_db()
+    final_list = list(set(all_rows))
     
-    items = get_us_stock_list()
-    if not items:
-        log("❌ 無法取得美股清單，任務終止。")
-        return {"fail_list": [], "success": 0, "has_changed": False}
+    # 儲存清單快取
+    with open(CACHE_LIST_PATH, "w", encoding="utf-8") as f:
+        json.dump(final_list, f, ensure_ascii=False)
+        
+    log(f"✅ 清單已更新並儲存，共 {len(final_list)} 檔。")
+    return final_list
 
-    log(f"🚀 開始執行美股 ({mode.upper()}) | 目標: {len(items)} 檔")
+def download_stock_data(item):
+    """
+    ⚡ 檔案級快取：
+    若硬碟已存在該代號 CSV 且大小正確，直接跳過下載
+    """
+    try:
+        parts = item.split('&', 1)
+        if len(parts) < 2: return {"status": "error"}
+        yf_tkr, name = parts
+        safe_name = "".join([c for c in name if c.isalnum() or c in (' ', '_', '-')]).strip()
+        out_path = os.path.join(DATA_DIR, f"{yf_tkr}_{safe_name}.csv")
+        
+        # ✅ 快取核心：檢查檔案是否存在
+        if os.path.exists(out_path) and os.path.getsize(out_path) > 1000:
+            return {"status": "exists", "tkr": yf_tkr}
 
-    stats = {"success": 0, "cache": 0, "empty": 0, "error": 0}
-    fail_list = []
-    task_args = [(it[0], it[1], mode) for it in items]
+        # --- 若快取不存在才執行下載 ---
+        time.sleep(random.uniform(0.4, 1.2))
+        tk = yf.Ticker(yf_tkr)
+        
+        for attempt in range(2):
+            try:
+                hist = tk.history(period="2y", timeout=20)
+                if hist is not None and not hist.empty:
+                    hist.reset_index(inplace=True)
+                    hist.columns = [c.lower() for c in hist.columns]
+                    hist.to_csv(out_path, index=False, encoding='utf-8-sig')
+                    return {"status": "success", "tkr": yf_tkr}
+            except Exception as e:
+                if "Rate limited" in str(e): time.sleep(random.uniform(20, 40))
+            time.sleep(random.uniform(3, 6))
+
+        return {"status": "empty", "tkr": yf_tkr}
+    except: return {"status": "error"}
+
+def main():
+    items = get_full_stock_list()
+    if not items: return log("❌ 無清單。")
+
+    log(f"🚀 開始美股任務 (雙重快取啟動中)")
+    stats = {"success": 0, "exists": 0, "empty": 0, "error": 0}
     
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(download_one, arg): arg for arg in task_args}
-        pbar = tqdm(total=len(items), desc=f"US處理中({mode})")
-        
-        for f in as_completed(futures):
-            res = f.result()
-            s = res.get("status", "error")
-            stats[s] += 1
-            if s == "error":
-                fail_list.append(res.get("symbol"))
+        futures = {executor.submit(download_stock_data, it): it for it in items}
+        pbar = tqdm(total=len(items), desc="美股進度", unit="檔")
+        for future in as_completed(futures):
+            res = future.result()
+            stats[res.get("status", "error")] += 1
             pbar.update(1)
+            # 只有在真正下載(success)時才需要長休眠，快取跳過時不需要
         pbar.close()
-
-    # 💡 判斷變動標記
-    has_changed = stats['success'] > 0
     
-    if has_changed or IS_GITHUB_ACTIONS:
-        log("🧹 偵測到變動或雲端環境，優化資料庫 (VACUUM)...")
-        conn = sqlite3.connect(DB_PATH)
-        conn.execute("VACUUM")
-        conn.close()
-    else:
-        log("⏩ 美股數據無變動，跳過 VACUUM。")
-
-    duration = (time.time() - start_time) / 60
-    log(f"📊 同步完成！費時: {duration:.1f} 分鐘")
-    log(f"✅ 新增: {stats['success']} | ⚡ 快取跳過: {stats['cache']} | ❌ 錯誤: {stats['error']}")
-
-    return {
-        "success": stats['success'] + stats['cache'],
-        "fail_list": fail_list,
-        "has_changed": has_changed
-    }
+    log(f"📊 報告: 成功={stats['success']}, 跳過={stats['exists']}, 無資料={stats['empty']}, 失敗={stats['error']}")
 
 if __name__ == "__main__":
-    run_sync(mode='hot')
+    main()
